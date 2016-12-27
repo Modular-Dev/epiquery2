@@ -60,6 +60,7 @@ selectConnection = (context, callback) ->
       return callback msg
   else
     context.connection = connectionConfig
+  context.driver = core.selectDriver context.connection
 
   # Replica check here...
   log.debugRequest context.debug, "[q:#{context.queryId}] context.connection.name", context.connection.name
@@ -110,18 +111,18 @@ renderTemplate = (context, callback) ->
   )
 
 executeQuery = (context, callback) ->
-  driver = core.selectDriver context.connection
   context.emit 'beginqueryexecution'
   queryCompleteCallback = (err, data) ->
     context.Stats.endDate = new Date()
     if err
-      log.error "[q:#{context.queryId}] error executing query #{err}"
+      log.error "[q:#{context.queryId}, t:#{context.templateName}] error executing query #{err}"
       context.emit 'error', err, data
 
     context.emit 'endquery', data
     core.removeInflightQuery context.templateName
     callback null, context
-  query.execute(driver,
+  query.execute(
+    context.driver,
     context,
     queryCompleteCallback
   )
@@ -136,7 +137,11 @@ collectStats = (context, callback) ->
     context.templateName
     stats.executionTimeInMillis
   )
-  log.info "[EXECUTION STATS] template: '#{context.templateName}', duration: #{stats.executionTimeInMillis}ms"
+  # supporting pooling is optional, so some drivers won't have pool details
+  if context.connectionPoolKey
+    log.info "[EXECUTION STATS] template: '#{context.templateName}', duration: #{stats.executionTimeInMillis}ms, connWait: #{context.connectionAcquisitionDuration}ms, pool: #{context.connectionPoolKey}"
+  else
+    log.info "[EXECUTION STATS] template: '#{context.templateName}', duration: #{stats.executionTimeInMillis}ms"
   callback null, context
 
 sanitizeInput = (context, callback) ->
@@ -145,13 +150,9 @@ sanitizeInput = (context, callback) ->
       _.each Object.keys(special_characters), (keyCode) ->
         def = special_characters[keyCode]
         parent[key] = value.replace def.regex, def.replace
-
-  callback null, context
-
-escapeInput = (context, callback) ->
-  _.walk.preorder context.templateContext, (value, key, parent) ->
-    if parent
-      parent[key] = value.replace(/'/g, "''") if _.isString(value)
+  context.unEscapedTemplateContext = _.cloneDeep context.templateContext
+  if context.driver.class.prototype.escapeTemplateContext
+    context.driver.class.prototype.escapeTemplateContext(context.templateContext)
   callback null, context
 
 queryRequestHandler = (context) ->
@@ -162,16 +163,15 @@ queryRequestHandler = (context) ->
     setupContext,
     logTemplateContext,
     getTemplatePath,
-    escapeInput,
+    selectConnection,
     sanitizeInput,
     renderTemplate,
-    selectConnection,
     executeQuery,
     collectStats
   ],
   (err, results) ->
     if err
-      log.error "[q:#{context.queryId}] queryRequestHandler Error: #{err}"
+      log.error "[q:#{context.queryId}, t:#{context.templateName}] queryRequestHandler Error: #{err}"
       context.emit 'error', err
     context.emit 'completequeryexecution'
 

@@ -8,7 +8,7 @@ DRIVER_POOL={}
 #https://github.com/pekim/tedious/issues/19
 #tedious and generic connection pooling is sort of crap
 
-getDriverInstance = (driver, connectionConfig, driverAquired) ->
+getDriverInstance = (driver, connectionConfig, driverAcquired) ->
   pool = DRIVER_POOL[connectionConfig.name]
   if not pool
     pool = Pool({
@@ -16,7 +16,22 @@ getDriverInstance = (driver, connectionConfig, driverAquired) ->
       create: (cb) ->
         log.debug "creating driver instance for connection #{connectionConfig.name}"
         d = new driver.class(connectionConfig.config)
-        d.connect(cb)
+        connectionAttempts = 0
+        connectionHandler = (err, connectedInstance) ->
+          connectionAttempts += 1
+          if err
+            if connectionAttempts > 8
+              log.error "unable to connect successfully to #{connectionConfig.name} after %s attempts \n%s\n", (connectionAttempts - 1), err, err.stack
+              return cb(err)
+            attemptConnect = ->
+              log.warn "attempting reconnect for connection #{connectionConfig.name} because #{err}"
+              d.connect(connectionHandler)
+            setTimeout(attemptConnect, Math.pow(2, connectionAttempts))
+          else
+            if connectionAttempts > 1
+              log.warn "successful connection for #{connectionConfig.name} after #{connectionAttempts} attempts"
+            cb(connectedInstance)
+        d.connect(connectionHandler)
       destroy: (driver) -> driver.disconnect()
       validate: (driver) ->
         # if the driver has a validate method, use it, otherwise we'll
@@ -30,7 +45,9 @@ getDriverInstance = (driver, connectionConfig, driverAquired) ->
       max: 50
     })
     DRIVER_POOL[connectionConfig.name] = pool
-  pool.acquire(driverAquired)
+  poolAcquireStart = new Date()
+  pool.acquire (err, poolItem) ->
+    driverAcquired(err, poolItem, new Date().getTime() - poolAcquireStart.getTime(), connectionConfig.name)
 
 execute = (driver, context, cb) ->
   query = context.renderedTemplate
@@ -38,7 +55,11 @@ execute = (driver, context, cb) ->
   # if we have a driver that supports pooling we'll use pooling, which is defined by a driver
   # having a connect and disconnect method
   if typeof(driver.class.prototype.connect) is "function" && typeof(driver.class.prototype.disconnect) is "function"
-    getDriverInstance(driver, config, (err, driver) ->
+    getDriverInstance(driver, config, (err, driver, acquisitionDuration, poolKey) ->
+      # tracking the time it takes to get a connection
+      context.connectionAcquisitionDuration = acquisitionDuration
+      # and the pool used
+      context.connectionPoolKey = poolKey
       if err
         message = "unable to acquire driver from pool for connection: #{config.name}"
         log.error message, err
@@ -63,7 +84,13 @@ attachAndExecute = (driverInstance, context, cb) ->
 
   endqueryHandler = ->
     pool = DRIVER_POOL[context.connection.name]
-    pool.release(driverInstance) if pool
+    if pool and driverInstance.resetForReleaseToPool
+      driverInstance.resetForReleaseToPool (err) ->
+        if err
+          driverInstance.invalidate()
+        pool.release(driverInstance)
+    else if pool
+      pool.release(driverInstance)
 
     driverInstance
       .removeListener('beginrowset', beginrowsetHandler)
@@ -88,7 +115,7 @@ attachAndExecute = (driverInstance, context, cb) ->
     context.emit 'data', {queryId: queryId, data: data}
 
   errorHandler = (err) ->
-    log.error "[q:#{context.queryId}] te %j", err
+    log.error "[q:#{context.queryId}, t:#{context.templateName}] te %j", err
     pool = DRIVER_POOL[context.connection.name]
     pool.destroy(driverInstance) if pool
 
