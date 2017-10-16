@@ -33,7 +33,8 @@ core.init()
 if config.isDevelopmentMode()
   log.warn "epiquery2 running in development mode, this will cause requests to be slower"
   set_cors_headers = (req, res, next) ->
-    res.header 'Access-Control-Allow-Origin', '*'
+    res.header 'Access-Control-Allow-Origin', req.get('Origin') ? '*'
+    res.header 'Access-Control-Allow-Credentials', true
     res.header 'Access-Control-Allow-Headers', 'Content-Type'
     res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     next()
@@ -46,6 +47,8 @@ app.get '/diagnostic', (req, res) ->
   response =
     message: "ok"
     connections: _.pluck(config.connections, 'name')
+  if config.isDevelopmentMode
+    response.aclsEnabled = config.enableTemplateAcls
   res.send response
 
 app.get '/templates', (req, res) ->
@@ -55,7 +58,7 @@ app.get '/templates', (req, res) ->
 
 app.get '/stats', (req, res) ->
   stats =
-    # execution time data is a object contiaining 
+    # execution time data is a object contiaining
     # "templateName": <CircularBuffer of recent exedution times>
     # properties
     recentExecutionTimes: _.map core.getQueryExecutionTimes, (v, k, l) ->
@@ -108,6 +111,7 @@ socketServer.on 'connection', (conn) ->
       connectionName: message.connectionName
       queryId: message.queryId
       templateContext: message.data
+      requestHeaders: conn.headers
     ctxParms.debug if message.debug
     context = new Context(ctxParms)
     log.debug "[q:#{context.queryId}] starting processing"
@@ -123,7 +127,7 @@ socketServer.on 'error', (e) ->
 
 app.get /\/(.+)$/, httpRequestHandler
 app.post /\/(.+)$/, httpRequestHandler
-  
+
 log.debug "server worker process starting with configuration"
 log.info "%j", config
 log.debug "node version", process.version

@@ -16,7 +16,7 @@ transformer = require './transformer.coffee'
 special_characters = {
   "8220": regex: new RegExp(String.fromCharCode(8220), "gi"), "replace": '"'
   "8221": regex: new RegExp(String.fromCharCode(8221), "gi"), "replace": '"'
-  "8216": regex:  new RegExp(String.fromCharCode(8216), "gi"), "replace": "'"
+  "8216": regex: new RegExp(String.fromCharCode(8216), "gi"), "replace": "'"
   "8217": regex: new RegExp(String.fromCharCode(8217), "gi"), "replace": "'"
   "8211": regex: new RegExp(String.fromCharCode(8211), "gi"), "replace": "-"
   "8212": regex: new RegExp(String.fromCharCode(8212), "gi"), "replace": "--"
@@ -83,7 +83,7 @@ selectConnection = (context, callback) ->
 
 getTemplatePath = (context, callback) ->
   log.debugRequest context.debug, "[q:#{context.queryId}] getting template path for #{context.templateName}"
-  # first we make sure that, if we are whitelisting templates, that 
+  # first we make sure that, if we are whitelisting templates, that
   # our requested template is in a whitelisted directory
   if config.allowedTemplates isnt null
     templateDir = path.dirname context.templateName
@@ -102,13 +102,32 @@ renderTemplate = (context, callback) ->
   templates.renderTemplate(
     context.templatePath,
     context.templateContext,
-    (err, rawTemplate, renderedTemplate) ->
+    (err, rawTemplate, renderedTemplate, templateConfig) ->
       context.rawTemplate = rawTemplate
+      context.templateConfig = templateConfig
       log.debugRequest context.debug, "raw template: \n #{context.rawTemplate}"
       context.renderedTemplate = renderedTemplate
       log.debugRequest context.debug, "rendered template: \n #{context.renderedTemplate}"
       callback err, context
   )
+
+testExecutionPermissions = (context, callback) ->
+  # we make it possible to disable ACL checking but make it kind of hard, you must be running in
+  # development mode AND explicitly set ENABLE_TEMPLATE_ACLS to 'DISABLED', this is only a concession
+  # to folks using this locally for development and backwards compatability with otherwise secured
+  # instances
+  return callback(null, context) if config.enableTemplateAcls is 'DISABLED'
+
+  log.debug "templateConfig %s: %j", context.templatePath, context.templateConfig
+
+  # we check for ANY match between the executionMasks within the template, and matching headers
+  for own key of context.templateConfig?.executionMasks
+    if context.requestHeaders[key] and (context.requestHeaders[key] & context.templateConfig.executionMasks[key])
+      log.debug "execution allowed by acl"
+      return callback null, context
+
+  log.debug "Execution denied by acl: Headers %j template config: %j", context.requestHeaders, context.templateConfig
+  return callback(new Error("Execution denied by acl"), context)
 
 executeQuery = (context, callback) ->
   context.emit 'beginqueryexecution'
@@ -148,8 +167,13 @@ sanitizeInput = (context, callback) ->
   _.walk.preorder context.templateContext, (value, key, parent) ->
     if _.isString value
       _.each Object.keys(special_characters), (keyCode) ->
+        # do not escape our JSON data since it's JSON and does it's own thing
+        # oh, and don't try to lower case things that don't have the toLowerCase
+        # method, such as numbers which are the 'keys' of arrays
+        return if key.toLowerCase and key.toLowerCase().startsWith 'json'
         def = special_characters[keyCode]
-        parent[key] = value.replace def.regex, def.replace
+        value = value.replace def.regex, def.replace
+      parent[key] = value
   context.unEscapedTemplateContext = _.cloneDeep context.templateContext
   if context.driver.class.prototype.escapeTemplateContext
     context.driver.class.prototype.escapeTemplateContext(context.templateContext)
@@ -166,6 +190,7 @@ queryRequestHandler = (context) ->
     selectConnection,
     sanitizeInput,
     renderTemplate,
+    testExecutionPermissions,
     executeQuery,
     collectStats
   ],
